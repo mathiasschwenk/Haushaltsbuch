@@ -1717,39 +1717,72 @@ function setAnalysisType(type, btn) {
   renderAnalysis();
 }
 
+// Returns the pro-rated monthly amount for a recurring entry
+function recMonthlyAmount(r) {
+  return r.amount / INTERVAL_MONTHS[r.interval];
+}
+
+// Builds a combined entry list for a given month: real transactions + recurring contributions
+function getMonthEntries(m, y, typeFilter) {
+  const entries = [];
+
+  // 1. Real transactions in that month
+  db.transactions
+    .filter(tx => {
+      const d = new Date(tx.date);
+      return d.getMonth() === m && d.getFullYear() === y &&
+             (typeFilter === 'all' || tx.type === typeFilter);
+    })
+    .forEach(tx => entries.push({
+      cat: tx.cat, type: tx.type,
+      label: getCatLabel(tx.type, tx.cat),
+      amount: tx.amount,
+      source: 'tx'
+    }));
+
+  // 2. Recurring entries (pro-rated to monthly equivalent)
+  db.recurring
+    .filter(r => typeFilter === 'all' || r.type === typeFilter)
+    .forEach(r => entries.push({
+      cat: r.cat, type: r.type,
+      label: getCatLabel(r.type, r.cat),
+      amount: recMonthlyAmount(r),
+      source: 'rec'
+    }));
+
+  return entries;
+}
+
+// Aggregate entries by category
+function aggregateByCat(entries) {
+  const map = {};
+  entries.forEach(e => {
+    const key = e.cat + '_' + e.type;
+    if (!map[key]) map[key] = { amount: 0, label: e.label, type: e.type, cat: e.cat };
+    map[key].amount += e.amount;
+  });
+  return Object.values(map).sort((a, b) => b.amount - a.amount);
+}
+
 function renderAnalysis() {
   document.getElementById('analysisMonthLabel').textContent = monthName(analysisMonth, analysisYear);
 
-  const txs = db.transactions.filter(tx => {
-    const d = new Date(tx.date);
-    return d.getMonth() === analysisMonth && d.getFullYear() === analysisYear;
-  });
-
-  let filtered = txs;
-  if (analysisType === 'income') filtered = txs.filter(t => t.type === 'income');
-  if (analysisType === 'expense') filtered = txs.filter(t => t.type === 'expense');
-
-  // PIE CHART
-  const catTotals = {};
-  filtered.forEach(tx => {
-    const key = tx.cat + '_' + tx.type;
-    catTotals[key] = (catTotals[key] || { amount: 0, label: getCatLabel(tx.type, tx.cat), type: tx.type });
-    catTotals[key].amount += tx.amount;
-  });
-
-  const catEntries = Object.values(catTotals).sort((a, b) => b.amount - a.amount);
   const pieColors = [
     '#2d7d6f','#3a9e8d','#5bbdac','#84d0c4','#b8e8e2',
     '#c0544a','#d97a70','#eca09a','#f5c8c4','#b8860b',
     '#d4a017','#e8c060','#f5dca0','#7a9e6f','#a8c89a'
   ];
 
+  // ── PIE CHART: current selected month, all sources ──────────
+  const monthEntries = getMonthEntries(analysisMonth, analysisYear, analysisType);
+  const catEntries   = aggregateByCat(monthEntries);
+
   const pieCtx = document.getElementById('pieChart').getContext('2d');
   if (pieChartInst) pieChartInst.destroy();
 
   if (catEntries.length === 0) {
     pieChartInst = null;
-    document.getElementById('pieChart').getContext('2d').clearRect(0, 0, 500, 260);
+    pieCtx.clearRect(0, 0, pieCtx.canvas.width, pieCtx.canvas.height);
   } else {
     pieChartInst = new Chart(pieCtx, {
       type: 'doughnut',
@@ -1768,47 +1801,43 @@ function renderAnalysis() {
         plugins: {
           legend: {
             position: 'right',
-            labels: {
-              font: { family: 'DM Sans', size: 11 },
-              color: '#5c5148',
-              boxWidth: 12,
-              padding: 8
-            }
+            labels: { font: { family: 'DM Sans', size: 11 }, color: '#5c5148', boxWidth: 12, padding: 8 }
           },
-          tooltip: {
-            callbacks: {
-              label: (ctx) => ` ${ctx.label}: ${fmt(ctx.raw)}`
-            }
-          }
+          tooltip: { callbacks: { label: (ctx) => ` ${ctx.label}: ${fmt(ctx.raw)}` } }
         }
       }
     });
   }
 
-  // BAR CHART — last 6 months
-  const months = [];
+  // ── BAR CHART: last 6 months, transactions + recurring ──────
+  const sixMonths = [];
   for (let i = 5; i >= 0; i--) {
-    let m = analysisMonth - i;
-    let y = analysisYear;
+    let m = analysisMonth - i, y = analysisYear;
     while (m < 0) { m += 12; y--; }
-    months.push({ m, y });
+    sixMonths.push({ m, y });
   }
 
-  const barIncome = months.map(({ m, y }) =>
-    db.transactions.filter(tx => {
-      const d = new Date(tx.date);
-      return d.getMonth() === m && d.getFullYear() === y && tx.type === 'income';
-    }).reduce((s, t) => s + t.amount, 0)
-  );
+  // Recurring monthly totals (same every month – pro-rated), respecting type filter
+  const recMonthlyIncome  = (analysisType === 'expense') ? 0 :
+    db.recurring.filter(r => r.type === 'income' ).reduce((s,r) => s + recMonthlyAmount(r), 0);
+  const recMonthlyExpense = (analysisType === 'income')  ? 0 :
+    db.recurring.filter(r => r.type === 'expense').reduce((s,r) => s + recMonthlyAmount(r), 0);
 
-  const barExpense = months.map(({ m, y }) =>
-    db.transactions.filter(tx => {
-      const d = new Date(tx.date);
-      return d.getMonth() === m && d.getFullYear() === y && tx.type === 'expense';
-    }).reduce((s, t) => s + t.amount, 0)
-  );
+  const barIncome = sixMonths.map(({ m, y }) => {
+    const txSum = db.transactions
+      .filter(tx => { const d = new Date(tx.date); return d.getMonth()===m && d.getFullYear()===y && tx.type==='income'; })
+      .reduce((s, t) => s + t.amount, 0);
+    return txSum + recMonthlyIncome;
+  });
 
-  const barLabels = months.map(({ m, y }) =>
+  const barExpense = sixMonths.map(({ m, y }) => {
+    const txSum = db.transactions
+      .filter(tx => { const d = new Date(tx.date); return d.getMonth()===m && d.getFullYear()===y && tx.type==='expense'; })
+      .reduce((s, t) => s + t.amount, 0);
+    return txSum + recMonthlyExpense;
+  });
+
+  const barLabels = sixMonths.map(({ m, y }) =>
     new Date(y, m, 1).toLocaleDateString('de-DE', { month: 'short' })
   );
 
@@ -1820,64 +1849,62 @@ function renderAnalysis() {
     data: {
       labels: barLabels,
       datasets: [
-        {
-          label: 'Einnahmen',
-          data: barIncome,
-          backgroundColor: 'rgba(45,125,111,0.75)',
-          borderRadius: 6
-        },
-        {
-          label: 'Ausgaben',
-          data: barExpense,
-          backgroundColor: 'rgba(192,84,74,0.75)',
-          borderRadius: 6
-        }
+        { label: 'Einnahmen', data: barIncome,  backgroundColor: 'rgba(45,125,111,0.75)', borderRadius: 6 },
+        { label: 'Ausgaben',  data: barExpense, backgroundColor: 'rgba(192,84,74,0.75)',  borderRadius: 6 }
       ]
     },
     options: {
       responsive: true,
       maintainAspectRatio: false,
       plugins: {
-        legend: {
-          labels: { font: { family: 'DM Sans', size: 12 }, color: '#5c5148' }
-        },
-        tooltip: {
-          callbacks: { label: (ctx) => ` ${ctx.dataset.label}: ${fmt(ctx.raw)}` }
-        }
+        legend: { labels: { font: { family: 'DM Sans', size: 12 }, color: '#5c5148' } },
+        tooltip: { callbacks: { label: (ctx) => ` ${ctx.dataset.label}: ${fmt(ctx.raw)}` } }
       },
       scales: {
         x: { grid: { display: false }, ticks: { font: { family: 'DM Sans', size: 11 }, color: '#9e9089' } },
         y: {
           grid: { color: '#ede8e0' },
-          ticks: {
-            font: { family: 'DM Sans', size: 11 },
-            color: '#9e9089',
-            callback: (v) => '€ ' + v.toLocaleString('de-DE')
-          }
+          ticks: { font: { family: 'DM Sans', size: 11 }, color: '#9e9089',
+            callback: (v) => '€ ' + v.toLocaleString('de-DE') }
         }
       }
     }
   });
 
-  // Category Breakdown List
+  // ── CATEGORY BREAKDOWN LIST ───────────────────────────────────
   const bdList = document.getElementById('catBreakdownList');
+
   if (catEntries.length === 0) {
     bdList.innerHTML = '<div style="text-align:center;padding:20px;color:var(--text-light);font-size:13px">Keine Daten für diesen Monat</div>';
     return;
   }
 
+  // Separate real-tx and recurring contributions per cat for labelling
+  const recContribMap = {};
+  db.recurring
+    .filter(r => analysisType === 'all' || r.type === analysisType)
+    .forEach(r => {
+      const key = r.cat + '_' + r.type;
+      recContribMap[key] = (recContribMap[key] || 0) + recMonthlyAmount(r);
+    });
+
   const total = catEntries.reduce((s, c) => s + c.amount, 0);
   bdList.innerHTML = catEntries.map((c, i) => {
-    const pct = total > 0 ? (c.amount / total * 100).toFixed(1) : 0;
+    const pct   = total > 0 ? (c.amount / total * 100).toFixed(1) : 0;
     const color = pieColors[i % pieColors.length];
+    const key   = c.cat + '_' + c.type;  // Note: catEntries don't have .cat – rebuild from label not ideal; use recContribMap differently
+    const recPart = recContribMap[key] || 0;
+    const recHint = recPart > 0
+      ? `<span style="background:var(--gold-pale);color:var(--gold);font-size:10px;font-weight:600;padding:1px 6px;border-radius:8px;margin-left:6px">🔄 ${fmt(recPart)} Dauer</span>`
+      : '';
     return `
-      <div style="margin-bottom:10px">
-        <div style="display:flex;justify-content:space-between;font-size:13px;margin-bottom:4px">
-          <span style="font-weight:500">${c.label}</span>
+      <div style="margin-bottom:12px">
+        <div style="display:flex;justify-content:space-between;align-items:center;font-size:13px;margin-bottom:4px;flex-wrap:wrap;gap:4px">
+          <span style="font-weight:500;display:flex;align-items:center">${c.label}${recHint}</span>
           <span style="color:var(--text-mid)">${fmt(c.amount)} · ${pct}%</span>
         </div>
         <div style="height:6px;background:var(--cream-dark);border-radius:3px;overflow:hidden">
-          <div style="height:100%;width:${pct}%;background:${color};border-radius:3px;transition:width 0.4s"></div>
+          <div style="height:100%;width:${pct}%;background:${color};border-radius:3px;transition:width 0.5s ease"></div>
         </div>
       </div>`;
   }).join('');
